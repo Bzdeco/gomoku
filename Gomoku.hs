@@ -7,11 +7,14 @@ import qualified Data.Tree as Tree
 import Control.Monad
 
 import System.CPUTime
+import System.IO
 import Text.Printf
 
 type Field = (Position, Color)
 type BoardMap = Map.Map Position Color
 type GameTree = Tree.Tree Game
+type Point = (Int, Int)
+type Region = (Point, Point)
 
 
 -- Color
@@ -86,7 +89,7 @@ data Move = Move {getPos :: Position, getCol :: Color}
 instance Show Move where
   show (Move pos col) = show col ++ "  on " ++ show pos
 
--- current board with evaluation beeing result or recent move
+-- current board with evaluation and saved recent move
 data Game = Game {getBoard :: Board, getMove :: Move, getVal :: Int}
 
 instance Show Game where
@@ -118,9 +121,6 @@ moves (Game board lastMove _) = [Game (nextBoard board move) move 0 | move <- ne
 
 
 -- Functions for gathering sequences of adjacent fields on board
-
-type Point = (Int, Int)
-type Region = (Point, Point)
 
 rowSequence :: Int -> Point -> [Point]
 rowSequence len (row,col) = zip (replicate len row) [y | y <- [col..col+len-1]]
@@ -170,8 +170,9 @@ lDiagStartPoints seqLen region
 
 allSequences :: Int -> Board -> [[Maybe Color]]
 allSequences len board = concatMap (\fun -> fun len allBoardRegion board) [rows, cols, rDiag, lDiag]
-  where
-    allBoardRegion = ((1,1),(19,19))
+
+allBoardRegion :: Region
+allBoardRegion = ((1,1),(19,19))
 
 rows :: Int -> Region -> Board -> [[Maybe Color]]
 rows seqLen region board = map (contents board . seqToPos . rowSequence seqLen) (rowStartPoints seqLen region)
@@ -185,7 +186,24 @@ rDiag seqLen region board = map (contents board . seqToPos . rDiagSequence seqLe
 lDiag :: Int -> Region -> Board -> [[Maybe Color]]
 lDiag seqLen region board = map (contents board . seqToPos . lDiagSequence seqLen) (lDiagStartPoints seqLen region)
 
--- evaluation function for MinMax
+-- maximum length patterns on all rows, cols and diagonals for validating end game (finding Seq 5)
+boardWidePatterns :: Color -> Board -> [[Pattern Int]]
+boardWidePatterns color board = map (\xs -> foldPattern color xs []) $
+  rows 19 allBoardRegion board ++
+  cols 19 allBoardRegion board ++
+  rDiag 19 allBoardRegion board ++
+  lDiag 19 allBoardRegion board ++
+  subdiags
+  where
+    subdiags = map (contents board . seqToPos) diagPointSequences
+    diagPointSequences = map (\len -> rDiagSequence len (19-len+1,1)) [5..18] ++
+                         map (\len -> rDiagSequence len (1,19-len+1)) [18,17..5] ++
+                         map (\len -> lDiagSequence len (19-len+1,19)) [18,17..5] ++
+                         map (\len -> lDiagSequence len (1,len)) [5..18]
+
+
+
+-- Evaluation function
 
 -- white is a maximizer, black is a minimizer
 staticEvaluation :: Board -> Int
@@ -193,21 +211,47 @@ staticEvaluation board = evaluateBoardForColor board B - evaluateBoardForColor b
 
 evaluateBoardForColor :: Board -> Color -> Int
 evaluateBoardForColor board color
-  | Just 25 `elem` filteredRates = 100000   -- score for 5 in a row
+  | [Seq 5] `elem` fivesPatterns = 100000
+  | [Gap, Seq 4, Gap] `elem` sixesPatterns = 50000
+  | [Gap, Seq 3, Gap] `elem` fivesPatterns = 25000
   | otherwise = resultValue
   where
     resultValue = Maybe.fromJust result
     result = foldr (liftM2 (+)) (Just 0) filteredRates
     filteredRates = filter (/= Nothing) rates
-    rates = map (ratePattern color) (allSequences 5 board)
+    fivesPatterns = map (\xs -> foldPattern color xs []) fives
+    sixesPatterns = map (\xs -> foldPattern color xs []) sixes
+    rates = map (rateSequence color) fives
+    fives = allSequences 5 board
+    sixes = allSequences 6 board
+
+data Pattern a = Gap | Seq a deriving (Show, Eq)
+
+instance Functor Pattern where
+  fmap _ Gap = Gap
+  fmap f (Seq a) = Seq (f a)
+
+foldPattern :: Color -> [Maybe Color] -> [Pattern Int] -> [Pattern Int]
+foldPattern _ [] acc = reverse acc
+foldPattern color (x:xs) acc = case length acc of
+  0 | Maybe.isNothing x -> foldPattern color xs [Gap]
+    | Just color == x -> foldPattern color xs [Seq 1]
+    | otherwise -> [Gap]
+  _ | Maybe.isNothing x -> case head acc of
+      Gap -> foldPattern color xs acc
+      Seq _ -> foldPattern color xs (Gap : acc)
+    | Just color == x -> case head acc of
+      Gap -> foldPattern color xs (Seq 1 : acc)
+      Seq _ -> foldPattern color xs (fmap (+1) (head acc) : tail acc)
+    | otherwise -> [Gap]
 
 -- counts number of fields with stone of refColor
 -- returns Nothing if a field stone of other color is found
-ratePattern :: Color -> [Maybe Color] -> Maybe Int
-ratePattern refColor pattern = patternResult  -- non-linear scaling
+rateSequence :: Color -> [Maybe Color] -> Maybe Int
+rateSequence refColor sequence = sequenceResult
   where
-    patternResult = liftM2 (*) patternCount patternCount
-    patternCount = foldr (liftM2 (+)) (Just 0) (convert refColor pattern)
+    sequenceResult = Just (^2) <*> sequenceSum -- non-linear scaling
+    sequenceSum = foldr (liftM2 (+)) (Just 0) (convert refColor sequence)
 
 convert :: Color -> [Maybe Color] -> [Maybe Int]
 convert refColor colorList = map toInt colorList
@@ -249,7 +293,6 @@ adjacent (Pos (x1, y1)) (Pos (x2, y2))
 takenPositions :: Board -> [Position]
 takenPositions (Board boardMap) = map fst $ Map.toList boardMap
 
-
 -- terminates tree in nodes that are resulting in a win by whichever side
 terminate :: GameTree -> GameTree
 terminate (Tree.Node game subtrees)
@@ -259,8 +302,14 @@ terminate (Tree.Node game subtrees)
 isEndGame :: Game -> Bool
 isEndGame (Game board _ _)
   | radius (playingRegion board) < 5 = False
-  | otherwise = any (straightSeq 5 C) (contentsInRegion 5 (playingRegion board) board) ||
-                any (straightSeq 5 B) (contentsInRegion 5 (playingRegion board) board)
+  | otherwise = any (Seq 5 `elem`) (boardWidePatterns C boardWithoutWhite) ||
+                any (Seq 5 `elem`) (boardWidePatterns B boardWithoutBlack)
+    where
+      boardWithoutWhite = Board $ (Map.fromList . filter (isOfColor C) . Map.toList) (getMap board)
+      boardWithoutBlack = Board $ (Map.fromList . filter (isOfColor B) . Map.toList) (getMap board)
+      isOfColor :: Color -> (Position, Color) -> Bool
+      isOfColor refColor (Pos (_,_), color) = refColor == color
+
 
 rowRadius :: Region -> Int
 rowRadius ((x1, _), (x2, _)) = x2 - x1 + 1
@@ -283,20 +332,9 @@ playingRegion board =
         colCoords = map (snd . getCoords) taken
         taken = takenPositions board
 
-contentsInRegion :: Int -> Region -> Board -> [[Maybe Color]]
-contentsInRegion seqLen region board = map (contents board . seqToPos . rowSequence seqLen) (rowStartPoints seqLen region) ++
-                                       map (contents board . seqToPos . colSequence seqLen) (colStartPoints seqLen region) ++
-                                       map (contents board . seqToPos . rDiagSequence seqLen) (rDiagStartPoints seqLen region) ++
-                                       map (contents board . seqToPos . lDiagSequence seqLen) (lDiagStartPoints seqLen region)
-
-straightSeq :: Int -> Color -> [Maybe Color] -> Bool
-straightSeq 0 _ [] = True
-straightSeq n col (x:xs)
-  | Just col == x = straightSeq (n - 1) col xs
-  | otherwise = False
-
 
 -- MiniMax
+-- This code is based on solution presented in "Why Functional Programming Matters" by John Hughes
 
 maximize :: Tree.Tree Game -> Int
 maximize = maximum . maximize'
@@ -307,7 +345,7 @@ maximize' (Tree.Node _ subtrees) = mapMinimum (map minimize' subtrees)
 
 -- flatten list by calculating minimum of necessary sublists
 mapMinimum :: [[Int]] -> [Int]
-mapMinimum (xs:xss) = firstMinimum : (omitMax firstMinimum xss)
+mapMinimum (xs:xss) = firstMinimum : (omitForPotentialMax firstMinimum xss)
   where
     firstMinimum = minimum xs
 
@@ -320,23 +358,23 @@ minimize' (Tree.Node _ subtrees) = mapMaximum (map maximize' subtrees)
 
 -- flatten list by calculating maximums of necessary sublists
 mapMaximum :: [[Int]] -> [Int]
-mapMaximum (xs:xss) = firstMaximum : (omitMin firstMaximum xss)
+mapMaximum (xs:xss) = firstMaximum : (omitForPotentialMin firstMaximum xss)
   where
     firstMaximum = maximum xs
 
 -- discards all sublists which minimum is lower or equal to passed potential maximum
-omitMax :: Int -> [[Int]] -> [Int]
-omitMax _ [] = []
-omitMax potentialMax (xs:xss)
-  | minimumLEQ potentialMax xs == True = omitMax potentialMax xss
-  | otherwise = (minimum xs) : (omitMax (minimum xs) xss) -- new potential maximum
+omitForPotentialMax :: Int -> [[Int]] -> [Int]
+omitForPotentialMax _ [] = []
+omitForPotentialMax potentialMax (xs:xss)
+  | minimumLEQ potentialMax xs == True = omitForPotentialMax potentialMax xss
+  | otherwise = (minimum xs) : (omitForPotentialMax (minimum xs) xss) -- new potential maximum
 
 -- discards all sublists which maximum is greater or equal to passed potential minimum
-omitMin :: Int -> [[Int]] -> [Int]
-omitMin _ [] = []
-omitMin potentialMin (xs:xss)
-  | maximumGEQ potentialMin xs == True = omitMin potentialMin xss
-  | otherwise = (maximum xs) : (omitMin (maximum xs) xss) -- new potential minimum
+omitForPotentialMin :: Int -> [[Int]] -> [Int]
+omitForPotentialMin _ [] = []
+omitForPotentialMin potentialMin (xs:xss)
+  | maximumGEQ potentialMin xs == True = omitForPotentialMin potentialMin xss
+  | otherwise = (maximum xs) : (omitForPotentialMin (maximum xs) xss) -- new potential minimum
 
 -- returns true if minimum of passed list is lower or equal to value
 minimumLEQ :: Int -> [Int] -> Bool
@@ -373,12 +411,92 @@ moveValuePair (Tree.Node (Game _ move value) _) = (value, move)
 chooseBestNextMove :: Tree.Tree Game -> Move
 chooseBestNextMove (Tree.Node (Game _ _ value) subtrees) = Maybe.fromJust $ (lookup value . map moveValuePair) subtrees
 
-makeMove :: Game -> Game
-makeMove game = Game newBoard madeMove 0
+makeMove :: Game -> Int -> Game
+makeMove game searchDepth = Game newBoard madeMove 0
   where
     madeMove = (chooseBestNextMove . evaluateTree . terminate . trim . prune searchDepth . gametree) game
     newBoard = insert (getBoard game) (getCol madeMove) (getPos madeMove)
 
+
+-- Interactive
+
+main :: IO ()
+main = do
+  putStrLn "GOMOKU by Jakub Gwizdała\n"
+  chosenDifficulty <- askForDifficulty
+  chosenColor <- askForColor
+  startGame <- case chosenColor of
+    C -> return emptyGame
+    B -> return initGame
+  print startGame
+  play startGame chosenColor chosenDifficulty
+
+play :: Game -> Color -> Int -> IO ()
+play game playerColor searchDepth = do
+  chosenPosition <- askForPosition game
+  let afterPlayer = Game (insert (getBoard game) playerColor chosenPosition) (Move chosenPosition playerColor) 0
+  print afterPlayer
+  putStrLn "Computer's move in progress..."
+  case isEndGame afterPlayer of
+    True -> do
+      putStrLn "You won! Congratulations!"
+      return ()
+    False -> do
+      let afterComputer = makeMove afterPlayer searchDepth
+      print afterComputer
+      case isEndGame afterComputer of
+        True -> do
+          putStrLn "You lost :("
+          return ()
+        False -> do
+          play afterComputer playerColor searchDepth
+
+askForDifficulty :: IO Int
+askForDifficulty = do
+  putStrLn "Difficulty determines how many moves does the computer look ahead."
+  putStrLn "The higher the difficulty level the longer you have to wait for computer's move, e.g.:"
+  putStrLn "3 - a few minutes\n4 - up to 20 minutes"
+  putStr "Choose difficulty level: "
+  hFlush stdout
+  input <- getLine
+  return (read input :: Int)
+
+askForColor :: IO Color
+askForColor = do
+  putStr "Choose your color (b - black, w - white): "
+  hFlush stdout
+  input <- getLine
+  case input of
+    "b" -> return C
+    "w" -> return B
+    _ -> do
+      putStrLn "Invalid input, try again."
+      askForColor
+
+askForPosition :: Game -> IO Position
+askForPosition game = do
+  putStr "Enter next move as <row> <col>: "
+  hFlush stdout
+  input <- getLine
+  coords <- return $ (map (\x -> read x :: Int) . words) input
+  case length coords of
+    2 -> case areInBounds coords of
+      True -> do
+        let pos = Pos (head coords, last coords)
+        case free pos $ (getMap . getBoard) game of
+          True -> return pos
+          False -> do
+            putStrLn "This field is already taken, please choose other."
+            askForPosition game
+      False -> do
+        putStrLn "Invalid value of coordinates, try again."
+        askForPosition game
+    _ -> do
+      putStrLn "Invalid number of coordinates, try again."
+      askForPosition game
+
+areInBounds :: [Int] -> Bool
+areInBounds nums = all (>=1) nums && all (<=19) nums
 
 
 -- Settings
@@ -386,13 +504,8 @@ makeMove game = Game newBoard madeMove 0
 boardSize :: Int
 boardSize = 19
 
-startPoint :: Int
-startPoint
-  | odd boardSize = (boardSize + 1) `div` 2
-  | otherwise = boardSize `div` 2
-
 searchDepth :: Int
-searchDepth = 4
+searchDepth = 3
 
 emptyBoard :: Board
 emptyBoard = Board Map.empty
@@ -401,30 +514,24 @@ emptyGame :: Game
 emptyGame = Game emptyBoard (Move (Pos (-1,-1)) B) 0
 
 initBoard :: Board
-initBoard = Board (Map.fromList [(Pos (startPoint,startPoint), C)])
+initBoard = Board (Map.fromList [(Pos (10, 10), C)])
 
 initGame :: Game
-initGame = Game initBoard (Move (Pos (startPoint,startPoint)) C) 0
+initGame = Game initBoard (Move (Pos (10, 10)) C) 0
 
 
 -- Tests
 
-board6 :: Board
-board6 = Board (Map.fromList [(Pos (1, 1), C), (Pos (1, 3), B), (Pos (1, 5), C), (Pos (1, 6), C),
-                              (Pos (2, 2), B),
-                              (Pos (3, 2), B), (Pos (3, 4), C),
-                              (Pos (4, 2), B),
-                              (Pos (5, 2), B), (Pos (5, 3), B), (Pos (5, 4), C), (Pos (5, 5), B),
-                              (Pos (6, 2), B), (Pos (6, 4), C)])
+testBoard :: Board
+testBoard = Board (Map.fromList [(Pos (6, 11), B),
+                                 (Pos (7, 9), C), (Pos (7, 10), B),
+                                 (Pos (8, 9), B), (Pos (8, 10), C),
+                                 (Pos (9,8), B), (Pos (9, 9), B), (Pos (9, 10), C), (Pos (9, 11), B),
+                                 (Pos (10,7), B), (Pos (10, 9), C), (Pos (10, 10), C),
+                                 (Pos (11,6), B)])
 
-game6 :: Game
-game6 = Game board6 (Move (Pos (1, 1)) C) 0
-
-winningBoard :: Board
-winningBoard = Board (Map.fromList [(Pos (1,1), C), (Pos (1,2), C), (Pos (1,3), C), (Pos (1,4), C), (Pos (1,5), C)])
-
-winningGame :: Game
-winningGame = Game winningBoard (Move (Pos (1,5)) C) 0
+testGame :: Game
+testGame = Game testBoard (Move (Pos (6, 11)) B) 0
 
 autoplay :: Int -> Game -> IO Game
 autoplay 0 game = do
@@ -432,7 +539,7 @@ autoplay 0 game = do
   return game
 autoplay n game = do
   showGameState game
-  next <- return $ makeMove game
+  next <- return $ makeMove game searchDepth
   autoplay (n - 1) next
 
 benchmarkPlay :: Int -> Game -> IO ()
@@ -449,6 +556,10 @@ benchmarkPlay nMoves game = do
       minutes = floor $ (diff - fromIntegral (hour * 3600)) / 60
       seconds = diff - fromIntegral (hour * 3600) - fromIntegral (minutes * 60)
   printf "Test time: %0d h %0d min %0.3f sec\n" (hour :: Int) (minutes :: Int) (seconds :: Double)
+  let avgMoveDiff = diff / fromIntegral nMoves
+      avgMoveMinutes = floor $ avgMoveDiff / 60
+      avgMoveSeconds = avgMoveDiff - fromIntegral (avgMoveMinutes * 60)
+  printf "Avg. move time: %0d min %0.3f sec\n" (avgMoveMinutes :: Int) (avgMoveSeconds :: Double)
   putStrLn "Done."
   return ()
 
@@ -457,9 +568,9 @@ benchmarkEvaluation = do
   putStrLn "Evaluation"
   putStrLn "Computing..."
   start <- getCPUTime
-  eval <- return $ staticEvaluation board6
-  end <- getCPUTime
+  eval <- return $ staticEvaluation testBoard
   putStrLn $ "Eval: " ++ show eval
+  end <- getCPUTime
   let diff = (fromIntegral (end - start)) / (10^12)
       hour = floor (diff / 3600)
       minutes = floor $ (diff - fromIntegral (hour * 3600)) / 60
@@ -467,9 +578,6 @@ benchmarkEvaluation = do
   printf "Test time: %0d h %0d min %0.3f sec\n" (hour :: Int) (minutes :: Int) (seconds :: Double)
   putStrLn "Done."
   return ()
-
-main :: IO ()
-main = benchmarkEvaluation
 
 
 -- Debug
@@ -489,5 +597,3 @@ showTreeTop (Tree.Node node _) = print node
 nTreeNodes :: Tree.Tree a -> Int
 nTreeNodes (Tree.Node _ []) = 1
 nTreeNodes (Tree.Node _ subtrees) = 1 + (sum . map nTreeNodes) subtrees
-
--- lista funkcji aplikowanych na mapę
