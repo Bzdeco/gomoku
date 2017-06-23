@@ -8,6 +8,7 @@ import Control.Monad
 
 import System.CPUTime
 import System.IO
+import System.Environment
 import Text.Printf
 
 type Field = (Position, Color)
@@ -30,16 +31,16 @@ instance Show Color where
 newtype Position = Pos {getCoords :: (Int, Int)} deriving (Eq, Ord)
 
 instance Show Position where
-    show (Pos pair) = show pair
+    show (Pos (row,col)) = "(" ++ show col ++ "," ++ show row ++ ")"
 
 instance Read Position where
     readsPrec _ = readPosition
 
 readPosition :: ReadS Position
-readPosition = readParen True (\s -> [(Pos (read x :: Int, read y :: Int), t) |
-                                            (x, t'') <- lex s,
+readPosition = readParen True (\s -> [(Pos (read row :: Int, read col :: Int), t) |
+                                            (col, t'') <- lex s,
                                             (",", t') <- lex t'',
-                                            (y, t) <- lex t'])
+                                            (row, t) <- lex t'])
 
 
 -- Board
@@ -231,6 +232,7 @@ instance Functor Pattern where
   fmap _ Gap = Gap
   fmap f (Seq a) = Seq (f a)
 
+-- transforming list of contents of fields into Pattern format
 foldPattern :: Color -> [Maybe Color] -> [Pattern Int] -> [Pattern Int]
 foldPattern _ [] acc = reverse acc
 foldPattern color (x:xs) acc = case length acc of
@@ -299,6 +301,7 @@ terminate (Tree.Node game subtrees)
   | isEndGame game == True = Tree.Node game []
   | otherwise = Tree.Node game (map terminate subtrees)
 
+-- checks if any player scored 5 (and only 5) in a row
 isEndGame :: Game -> Bool
 isEndGame (Game board _ _)
   | radius (playingRegion board) < 5 = False
@@ -418,10 +421,61 @@ makeMove game searchDepth = Game newBoard madeMove 0
     newBoard = insert (getBoard game) (getCol madeMove) (getPos madeMove)
 
 
--- Interactive
+-- Tournament
 
 main :: IO ()
-main = do
+main = tournament
+
+-- tournament mode, program takes color as argument, outputs moves as (col,row) and reads opponent moves in such format
+tournament :: IO ()
+tournament = do
+  args <- getArgs
+  color <- case head args of
+    "w" -> return B
+    "b" -> return C
+  case color of
+    B -> playWhite emptyGame
+    C -> do
+      hPutStrLn stdout $ show $ (getPos . getMove) initGame -- opening move
+      hFlush stdout
+      playBlack initGame
+  return ()
+
+-- reading opponent's move, making move and writing it to stdout
+playWithColor :: Color -> Game -> IO ()
+playWithColor color game = do
+  posString <- hGetLine stdin
+  let pos = read posString :: Position
+      gameFromOpponent = Game (insert (getBoard game) (otherColor color) pos) (Move pos (otherColor color)) 0
+  case isEndGame gameFromOpponent of
+    True -> do
+      hPutStrLn stderr "LOST"
+      return ()
+    False -> do
+      let gameAfterMove = makeMove gameFromOpponent searchDepth
+      hPutStrLn stdout $ show $ (getPos . getMove) gameAfterMove
+      hFlush stdout
+      case isEndGame gameAfterMove of
+        True -> do
+          hPutStrLn stderr "WON"
+          return ()
+        False -> playWithColor color gameAfterMove
+
+playWhite :: Game -> IO ()
+playWhite = playWithColor B
+
+playBlack :: Game -> IO ()
+playBlack = playWithColor C
+
+
+-- Interactive
+
+-- To play interactive mode:
+-- main = interactive
+
+-- play interactively with computer (AI)
+interactive :: IO ()
+interactive = do
   putStrLn "GOMOKU by Jakub Gwizdała\n"
   chosenDifficulty <- askForDifficulty
   chosenColor <- askForColor
